@@ -1,20 +1,34 @@
 """
-jpg_to_dng_bw.py
-================
-Converts a single B&W JPEG to a synthetic CFA (Bayer) DNG that triggers
+jpg_to_dng_color.py
+===================
+Converts a single color JPEG to a synthetic CFA (Bayer) DNG that triggers
 Lightroom Classic's full raw processing pipeline, including AI Denoise and
 Raw Details -- features unavailable on JPEG files.
 
-Designed for cheaply scanned B&W film negatives and B&W prints.
+Designed for scanned color film negatives, color slides, and color prints.
 
 Pipeline:
-  JPG -> decode -> sRGB linearise -> Rec.709 luma -> normalise -> RGGB Bayer DNG
+  JPG -> decode -> apply_gamma_blend(GAMMA_BLEND) -> gray-world WB in linear
+  light -> RGGB remosaic -> 16-bit uint16 -> CFA DNG
 
 Workspace:
-# Drop exactly one JPG copy into C:/TEMP/jpg2dngBW_workspace/
-# Output: C:/TEMP/jpg2dngBW_workspace/DNGcfa_bw.dng
-# Log:    C:/TEMP/jpg2dngBW_workspace/DNGcfa_bw_log.txt
-# Clear both files from the workspace before the next run.
+# Drop exactly one JPG copy into C:/TEMP/jpg2dngCOLOR_workspace/
+# Output: C:/TEMP/jpg2dngCOLOR_workspace/DNGcfa_color.dng
+# Log:    C:/TEMP/jpg2dngCOLOR_workspace/DNGcfa_color_log.txt
+# Clear all files from the workspace before the next run.
+
+Variables:
+# GAMMA_BLEND = 0.75
+#   Controls how much sRGB display gamma is removed before writing pixel data
+#   into the DNG. 0.75 is the recommended starting point for color scans --
+#   partial linearisation avoids shadow crushing when LRC's raw tone curve
+#   stacks on top of the remaining gamma. Range: 0.0 (no linearisation, keep
+#   gamma as-is) to 1.0 (full IEC 61966-2-1 linearisation).
+#
+# COLOR_MATRIX = IEC 61966-2-1 sRGB-to-XYZ D65 (9 SRATIONAL pairs)
+#   Standard color transform for sRGB-encoded sources. Embedded as
+#   ColorMatrix1 (DNG tag 50721). Values are fixed rational numbers with
+#   denominator 10000.
 
 Deps:
   Pillow, numpy
@@ -22,13 +36,25 @@ Deps:
 
 import sys
 import struct
+import math
 import datetime
 import numpy as np
 from pathlib import Path
 from PIL import Image
 
-WORKSPACE   = Path(r"C:\TEMP\jpg2dngBW_workspace")
-OUTPUT_NAME = "DNGcfa_bw.dng"
+WORKSPACE   = Path(r"C:\TEMP\jpg2dngCOLOR_workspace")
+OUTPUT_NAME = "DNGcfa_color.dng"
+LOG_DIR     = WORKSPACE
+
+GAMMA_BLEND = 0.75
+
+# IEC 61966-2-1 sRGB-to-XYZ D65 color matrix (ColorMatrix1, DNG tag 50721).
+# Numerator/denominator pairs, denominator 10000.
+COLOR_MATRIX = [
+    ( 32405, 10000), (-15371, 10000), ( -4985, 10000),
+    ( -9693, 10000), ( 18760, 10000), (   416, 10000),
+    (   556, 10000), ( -2040, 10000), ( 10572, 10000),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -43,11 +69,27 @@ def srgb_to_linear(c: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Minimal CFA DNG writer -- mono pipeline only.
-# Unconditionally writes: identity ColorMatrix, D50 illuminant, zero
-# BaselineExposure, and neutral AsShotNeutral (1,1,1).
+# Blended linearisation
 # ---------------------------------------------------------------------------
-def write_cfa_dng(bayer16: np.ndarray, out_path: str, white_level: int) -> str:
+def apply_gamma_blend(arr: np.ndarray, gamma_blend: float) -> np.ndarray:
+    if gamma_blend >= 1.0:
+        return srgb_to_linear(arr)
+    if gamma_blend <= 0.0:
+        return arr.copy()
+    linear = srgb_to_linear(arr)
+    return arr * (1.0 - gamma_blend) + linear * gamma_blend
+
+
+# ---------------------------------------------------------------------------
+# Minimal CFA DNG writer -- color pipeline only.
+# Embeds COLOR_MATRIX as ColorMatrix1, D50 illuminant, per-image
+# BaselineExposure, and gray-world AsShotNeutral.
+# ---------------------------------------------------------------------------
+def write_cfa_dng(bayer16: np.ndarray, out_path: str,
+                  mode: str = 'color',
+                  baseline_exposure: float = 0.0,
+                  white_level: int = 65535,
+                  asshot_neutral: tuple = (1.0, 1.0, 1.0)) -> str:
     assert bayer16.ndim == 2,          "bayer16 must be 2D (H x W)"
     assert bayer16.dtype == np.uint16, "bayer16 must be uint16"
 
@@ -133,17 +175,17 @@ def write_cfa_dng(bayer16: np.ndarray, out_path: str, white_level: int) -> str:
     add_ascii     (50708, "Adobe DNG")
     add_shorts    (50717, [white_level])
 
-    # Mono-specific: identity ColorMatrix, D50 illuminant, zero BaselineExposure,
-    # neutral AsShotNeutral. All four Bayer positions carry the same luma value
-    # so no color transform is needed or wanted.
-    add_srationals(50721, [
-        (1,1),(0,1),(0,1),
-        (0,1),(1,1),(0,1),
-        (0,1),(0,1),(1,1),
-    ])
+    # Color: IEC 61966-2-1 sRGB-to-XYZ D65 ColorMatrix1, D50 illuminant,
+    # per-image BaselineExposure, gray-world AsShotNeutral (denom 1000000).
+    add_srationals(50721, COLOR_MATRIX)
     add_shorts    (50778, [21])
-    add_srational1(50730, 0.0)
-    add_rationals (50728, [(1,1),(1,1),(1,1)])
+    add_srational1(50730, baseline_exposure)
+    denom = 1000000
+    add_rationals (50728, [
+        (int(round(asshot_neutral[0] * denom)), denom),
+        (int(round(asshot_neutral[1] * denom)), denom),
+        (int(round(asshot_neutral[2] * denom)), denom),
+    ])
 
     entries_raw.sort(key=lambda e: e[0])
 
@@ -177,13 +219,14 @@ def write_cfa_dng(bayer16: np.ndarray, out_path: str, white_level: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Conversion -- mono pipeline only, full resolution, full linearisation.
+# Conversion -- color pipeline, full resolution.
 # ---------------------------------------------------------------------------
 def convert(src: Path) -> Path:
     out_path = WORKSPACE / OUTPUT_NAME
     run_ts   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print(f"  Processing 1/1: {src.name}")
+    print(f"  GammaBlend  : {GAMMA_BLEND}  (1.0=full linear, 0.0=keep gamma)")
     print(f"  Source      : {src}")
 
     # Load as float32 RGB in [0, 1]
@@ -193,39 +236,40 @@ def convert(src: Path) -> Path:
     arr     = arr_raw.astype(np.float32) / norm
     print(f"  Loaded      {arr.shape[1]}x{arr.shape[0]} px  (norm={norm:.0f})")
 
-    # Full sRGB linearisation (gamma_blend = 1.0)
-    linear = srgb_to_linear(arr)
+    # Blended linearisation
+    linear = apply_gamma_blend(arr, GAMMA_BLEND)
     print(f"  Linearised  range {linear.min():.4f}-{linear.max():.4f}")
 
-    # Rec.709 luma
-    luma = (0.2126 * linear[:, :, 0]
-          + 0.7152 * linear[:, :, 1]
-          + 0.0722 * linear[:, :, 2])
-    luma_min_pre = float(luma.min())
-    print(f"  Luma        Rec.709  range {luma.min():.4f}-{luma.max():.4f}")
+    # Gray-world WB in linear light
+    r_mean = float(linear[:, :, 0].mean())
+    g_mean = float(linear[:, :, 1].mean())
+    b_mean = float(linear[:, :, 2].mean())
+    g_mean = max(g_mean, 1e-6)
+    asshot_neutral = (
+        min(r_mean / g_mean, 1.0),
+        1.0,
+        min(b_mean / g_mean, 1.0),
+    )
+    print(f"  WB (gray-world)  R/G={asshot_neutral[0]:.4f}  B/G={asshot_neutral[2]:.4f}")
 
-    # Normalise to fill the full 0-65535 range -- maximises dynamic range
-    # without inventing data.
-    luma_max = float(luma.max())
-    if luma_max > 0:
-        luma = luma / luma_max
-    luma_min_post = float(luma.min())
-    luma_max_post = float(luma.max())
-    print(f"  Normalised  range {luma.min():.4f}-{luma.max():.4f}  (peak was {luma_max:.4f})")
+    # BaselineExposure from ratio of gamma mean to linear mean
+    mean_gamma  = float(arr.mean())
+    mean_linear = float(linear.mean())
+    be = -math.log2(mean_gamma / mean_linear) if mean_linear > 0 else -0.579
+    print(f"  BaselineExp : {be:.4f} EV")
 
     # Trim to even dimensions for Bayer grid
-    h, w     = luma.shape
+    h, w     = linear.shape[:2]
     h_e, w_e = h - (h % 2), w - (w % 2)
-    luma     = luma[:h_e, :w_e]
+    linear   = linear[:h_e, :w_e, :]
 
-    # Remosaic: all 4 Bayer positions = luma. Eliminates false colour in
-    # demosaic because there is no inter-channel variation to reconstruct.
+    # RGGB remosaic
     bayer = np.empty((h_e, w_e), dtype=np.float32)
-    bayer[0::2, 0::2] = luma[0::2, 0::2]
-    bayer[0::2, 1::2] = luma[0::2, 1::2]
-    bayer[1::2, 0::2] = luma[1::2, 0::2]
-    bayer[1::2, 1::2] = luma[1::2, 1::2]
-    print(f"  Remosaiced  RGGB Bayer {w_e}x{h_e} (all positions = luma)")
+    bayer[0::2, 0::2] = linear[0::2, 0::2, 0]  # R
+    bayer[0::2, 1::2] = linear[0::2, 1::2, 1]  # G
+    bayer[1::2, 0::2] = linear[1::2, 0::2, 1]  # G
+    bayer[1::2, 1::2] = linear[1::2, 1::2, 2]  # B
+    print(f"  Remosaiced  RGGB Bayer {w_e}x{h_e}")
 
     # Scale to 16-bit
     bayer16     = (bayer * 65535).clip(0, 65535).astype(np.uint16)
@@ -237,7 +281,11 @@ def convert(src: Path) -> Path:
         white_level = 1
     print(f"  16-bit      range {bayer16.min()}-{bayer16.max()}  (BitsPerSample=16, uint16)")
 
-    write_cfa_dng(bayer16, str(out_path), white_level=white_level)
+    write_cfa_dng(bayer16, str(out_path),
+                  mode='color',
+                  baseline_exposure=be,
+                  white_level=white_level,
+                  asshot_neutral=asshot_neutral)
 
     size_mb = out_path.stat().st_size / (1024 * 1024)
     print()
@@ -257,11 +305,11 @@ def convert(src: Path) -> Path:
 
     # Write structured log to workspace, overwriting any previous run.
     # Non-fatal if write fails.
-    log_path = WORKSPACE / "DNGcfa_bw_log.txt"
+    log_path = LOG_DIR / "DNGcfa_color_log.txt"
     log_text = (
         f"HEADER\n"
         f"------\n"
-        f"Script       : jpg_to_dng_bw.py\n"
+        f"Script       : jpg_to_dng_color.py\n"
         f"Run          : {run_ts}\n"
         f"Source file  : {src.name}\n"
         f"Source path  : {src}\n"
@@ -274,12 +322,11 @@ def convert(src: Path) -> Path:
         f"\n"
         f"PROCESSING\n"
         f"----------\n"
-        f"gamma_blend  : 1.0 (hardcoded -- located at the srgb_to_linear(arr) call in convert())\n"
-        f"Luma pre-norm : {luma_min_pre:.4f} - {luma_max:.4f}  (Rec.709, after linearisation)\n"
-        f"Luma post-norm: {luma_min_post:.4f} - {luma_max_post:.4f}\n"
-        f"Peak luma     : {luma_max:.4f}  (before normalisation)\n"
-        f"Remosaic      : All 4 Bayer positions set to luma ({w_e} x {h_e} px)\n"
-        f"Clipping      : {clipping}\n"
+        f"gamma_blend  : {GAMMA_BLEND}  (controls how much sRGB gamma is removed before writing to DNG)\n"
+        f"WB R/G       : {asshot_neutral[0]:.4f}\n"
+        f"WB B/G       : {asshot_neutral[2]:.4f}\n"
+        f"BaselineExp  : {be:.4f} EV\n"
+        f"Clipping     : {clipping}\n"
         f"\n"
         f"OUTPUT\n"
         f"------\n"
@@ -292,16 +339,19 @@ def convert(src: Path) -> Path:
         f"================================\n"
         f"\n"
         f"(a) Shadows crushed or too dark\n"
-        f"    Lower gamma_blend toward 0.5 or 0.3.\n"
-        f"    In this script gamma_blend is hardcoded at 1.0 via the srgb_to_linear(arr)\n"
-        f"    call in convert(). To change it, replace that call with:\n"
-        f"        apply_gamma_blend(arr, 0.5)  -- or your chosen value\n"
-        f"    apply_gamma_blend() is already defined in this script.\n"
+        f"    Lower GAMMA_BLEND toward 0.5 or 0.3.\n"
+        f"    Current value      : {GAMMA_BLEND}\n"
+        f"    Location in script : GAMMA_BLEND = {GAMMA_BLEND}  (near the top of the file)\n"
         f"\n"
-        f"(b) Overall too bright or too dark\n"
-        f"    gamma_blend affects shadow rendering but not overall brightness directly.\n"
-        f"    If the image is consistently too bright or too dark, check that the source\n"
-        f"    scan is not severely under- or overexposed before conversion.\n"
+        f"(b) Color cast present\n"
+        f"    Use the White Balance picker in Lightroom Classic on a neutral area,\n"
+        f"    then sync to remaining images.\n"
+        f"\n"
+        f"(c) Overall too bright\n"
+        f"    BaselineExposure is computed automatically from image statistics.\n"
+        f"    If consistently wrong, consider adjusting GAMMA_BLEND first -- a lower\n"
+        f"    value raises the blended-linear mean and reduces the BaselineExposure\n"
+        f"    correction applied by Lightroom.\n"
     )
     try:
         log_path.write_text(log_text, encoding="utf-8")
@@ -349,7 +399,7 @@ def main() -> None:
 
     print("\nDone.")
     print("WARNING: Before the next run, remove both the source JPG and")
-    print(f"         DNGcfa_bw.dng from {WORKSPACE}")
+    print(f"         DNGcfa_color.dng from {WORKSPACE}")
 
 
 if __name__ == "__main__":
