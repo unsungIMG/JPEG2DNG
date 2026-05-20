@@ -26,6 +26,7 @@ masking tools, and the complete Develop module.
 - [Gamma blend parameter](#gamma-blend-parameter)
 - [16-bit TIFF input](#16-bit-tiff-input)
 - [Companion batch scripts](#companion-batch-scripts)
+- [B&W Script: jpg_to_dng_bw.py](#bw-script-jpg_to_dng_bwpy)
 - [Technical notes](#technical-notes)
 - [License](#license)
 
@@ -313,6 +314,77 @@ Batch converts a folder of JPEG or TIFF files to CFA DNGs using per-image
 highlight clip, shadow delta vs source), automatic retry with stepped-down gamma
 on QC failure, and a NEEDS_REVIEW flag for images where all retries are
 exhausted.
+
+---
+
+## B&W Script: jpg_to_dng_bw.py
+
+### Purpose
+
+`jpg_to_dng_bw.py` is a simplified, no-configuration script built specifically
+for cheaply scanned B&W JPEGs. Its sole purpose is to produce a valid CFA DNG
+that Lightroom Classic will import as a raw file, unlocking **AI Denoise** and
+**Raw Details** — features that are unavailable on JPEG files. There are no
+command-line arguments and no configuration required.
+
+B&W conversion is substantially more reliable than colour conversion because
+there is no colour pipeline to distort. All three source channels are collapsed
+to a single Rec.709 luminance value in linear light, then written identically to
+all four Bayer positions. Lightroom's demosaic engine has nothing to push around
+and reconstructs a perfectly neutral monochrome image. The full Develop module,
+Adobe Monochrome profiles, AI Denoise, Raw Details, and all B&W-specific
+controls behave correctly.
+
+### Workflow
+
+Workspace folder: **`C:/TEMP/jpg2dngBW_workspace/`** (created automatically on first run)
+
+1. Drop **one JPG copy** into `C:/TEMP/jpg2dngBW_workspace/`
+2. Run: `py jpg_to_dng_bw.py`
+3. Retrieve your DNG from `C:/TEMP/jpg2dngBW_workspace/DNGcfa_bw.dng`
+4. Import into Lightroom Classic. Apply AI Denoise, Raw Details, tone, and crop.
+
+> **Warning: always work with a copy of your image. Never place an original
+> file in the workspace.**
+
+> **Warning: clear both the source JPG and `DNGcfa_bw.dng` from
+> `C:/TEMP/jpg2dngBW_workspace/` before the next run.** The output filename is
+> fixed; a stale DNG left in the workspace will be silently overwritten.
+
+### Variables
+
+These values are hardcoded inside the script. You do not need to change them for
+normal use, but they are documented here for reference when working with unusual
+or difficult scans.
+
+**`gamma_blend`** — hardcoded to `1.0` (full linearisation)
+
+Controls how much of the sRGB display gamma curve is removed from the pixel
+data before it is written into the DNG. Because this value is not exposed as a
+named variable, adjusting it requires editing the `convert()` function directly:
+replace the `srgb_to_linear(arr)` call with `apply_gamma_blend(arr, value)`,
+copying the `apply_gamma_blend()` helper from `jpg_to_cfa_dng.py`.
+
+| Value | Effect on LRC output |
+|---|---|
+| `1.0` (default) | Full sRGB linearisation (IEC 61966-2-1 piecewise). Mathematically correct for a raw sensor pipeline. LRC receives linear-light data and applies its own raw tone curve on top. Best dynamic range for most scans. |
+| `0.5` | Midpoint blend between gamma-encoded and fully linear. Softer shadow rolloff. Good starting point for scanned material with heavy shadow areas. |
+| `0.0` | No linearisation. Gamma-encoded sRGB values written as-is. Closest to the original scan appearance; LRC's raw tone curve still applies, so the result will be brighter and lighter than the source. |
+
+For most scanned B&W negatives and prints, `1.0` is correct and produces the
+best editing foundation in LRC. You may want to lower this value if shadows are
+being crushed compared to the source scan — this typically happens with
+shadow-heavy interiors, dark-bordered frames (window or door), or heavily
+underexposed negatives. In those cases, `0.3`–`0.5` is a useful starting range.
+
+Recommended starting points for difficult scans:
+
+| Scene type | Suggested value |
+|---|---|
+| Outdoor, even tones | 0.75 – 1.0 |
+| Mixed interior/exterior | 0.50 – 0.75 |
+| Dark-framed (window/door border) | 0.30 – 0.50 |
+| Shadow-heavy interior / dark negative | 0.25 – 0.40 |
 
 ---
 
